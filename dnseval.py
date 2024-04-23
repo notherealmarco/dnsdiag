@@ -97,20 +97,17 @@ def main():
     force_miss = False
     verbose = False
     color_mode = False
+    qnames_from_file = None
     qname = 'wikipedia.org'
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hf:c:t:w:S:TevCmXHDj:",
+        opts, args = getopt.getopt(sys.argv[1:], "hf:c:t:w:S:TevCmXHDj:i:",
                                    ["help", "file=", "count=", "type=", "wait=", "json=", "tcp", "edns", "verbose",
-                                    "color", "cache-miss", "srcip=", "tls", "doh", "dnssec"])
+                                    "color", "cache-miss", "srcip=", "tls", "doh", "dnssec", "input="])
     except getopt.GetoptError as err:
         print(err)
         usage()
-
-    if args and len(args) == 1:
-        qname = args[0]
-    else:
-        usage()
+        return
 
     for o, a in opts:
         if o in ("-h", "--help"):
@@ -120,6 +117,9 @@ def main():
         elif o in ("-f", "--file"):
             inputfilename = a
             fromfile = True
+        elif o in ("-i", "--input"):
+            qname = a
+            qnames_from_file = True
         elif o in ("-w", "--wait"):
             waittime = int(a)
         elif o in ("-m", "--cache-miss"):
@@ -154,6 +154,13 @@ def main():
         else:
             print("Invalid option: %s" % o)
             usage()
+            return
+
+    if args and len(args) == 1:
+        qname = args[0]
+    elif len(args) == 0 and not qnames_from_file:
+        usage()
+        return
 
     # validate RR type
     if not util.dns.valid_rdatatype(rdatatype):
@@ -178,6 +185,16 @@ def main():
         else:
             f = dns.resolver.get_default_resolver().nameservers
 
+        if qnames_from_file:
+            try:
+                with open(qname, 'rt') as flist:
+                    qnames = flist.read().splitlines()
+            except Exception as e:
+                print(e)
+                sys.exit(1)
+        else:
+            qnames = [qname]
+
         if len(f) == 0:
             print("Error: No nameserver specified")
 
@@ -187,11 +204,7 @@ def main():
         width = maxlen(f)
         blanks = (width - 5) * ' '
 
-        if not json_output:
-            print('server ', blanks,
-                  ' avg(ms)     min(ms)     max(ms)     stddev(ms)  lost(%)  ttl        flags                  response')
-            print((104 + width) * '-')
-
+        resolvers = []
         for server in f:
             # check if we have a valid dns server address
             if server.lstrip() == '':  # deal with empty lines
@@ -212,36 +225,38 @@ def main():
 
             if not resolver:
                 continue
-
-            try:
-                retval = util.dns.ping(qname, resolver, dst_port, rdatatype, waittime, count, proto, src_ip,
-                                       use_edns=use_edns, force_miss=force_miss, want_dnssec=want_dnssec)
-
-            except SystemExit:
-                break
-            except Exception as e:
-                print('%s: %s' % (server, e))
-                continue
-
-            resolver = server.ljust(width + 1)
-            text_flags = flags_to_text(retval.flags)
-
-            s_ttl = str(retval.ttl)
-            if s_ttl == "None":
-                s_ttl = "N/A"
-
-            if retval.r_lost_percent > 0:
-                l_color = color.O
             else:
-                l_color = color.N
+                resolvers.append((server, resolver))
 
-            if json_output:
+
+        progress = 0
+        progress_total = len(qnames) * len(resolvers)
+        data = []
+        for qname in qnames:
+            for server, resolver in resolvers:
+                try:
+                    retval = util.dns.ping(qname, resolver, dst_port, rdatatype, waittime, count, proto, src_ip,
+                                           use_edns=use_edns, force_miss=force_miss, want_dnssec=want_dnssec)
+
+                except SystemExit:
+                    break
+                except Exception as e:
+                    print('%s: %s' % (resolver, e))
+                    continue
+
+                text_flags = flags_to_text(retval.flags)
+
+                s_ttl = str(retval.ttl)
+                if s_ttl == "None":
+                    s_ttl = "N/A"
+
                 dns_data = {
                     'hostname': qname,
                     'timestamp': str(datetime.datetime.now()),
                     'r_min': retval.r_min,
                     'r_avg': retval.r_avg,
-                    'resolver': resolver.rstrip(),
+                    'r_stddev': retval.r_stddev,
+                    'resolver': server,
                     'r_max': retval.r_max,
                     'r_lost_percent': retval.r_lost_percent,
                     's_ttl': s_ttl,
@@ -250,31 +265,64 @@ def main():
                     'rcode': retval.rcode,
                     'rcode_text': retval.rcode_text,
                 }
-                outer_data = {
-                    'hostname': qname,
-                    'data': dns_data
-                }
+                data.append(dns_data)
 
-                if json_filename == '-':  # stdout
-                    print(json.dumps(outer_data, indent=2))
+                progress += 1
+                if verbose and retval.answer and not json_output:
+                    ans_index = 1
+                    for answer in retval.answer:
+                        print("Answer %d [ %s%s%s ]" % (ans_index, color.G, answer, color.N))
+                        ans_index += 1
+                    print(f"Progress: {progress}/4")
+                    print("")
                 else:
-                    with open(json_filename, 'a+') as outfile:
-                        json.dump(outer_data, outfile, indent=2)
+                    print(f"Progress: {progress}/{progress_total}", end="\r")
 
+        if json_output:
+            if json_filename == '-':  # stdout
+                print(json.dumps(data, indent=2))
             else:
-                print("%s    %-8.3f    %-8.3f    %-8.3f    %-8.3f    %s%%%-3d%s     %-8s  %21s   %-20s" % (
-                    resolver, retval.r_avg, retval.r_min, retval.r_max, retval.r_stddev, l_color, retval.r_lost_percent,
-                    color.N, s_ttl, text_flags, retval.rcode_text), flush=True)
+                with open(json_filename, 'a+') as outfile:
+                    json.dump(data, outfile, indent=2)
 
-            if verbose and retval.answer and not json_output:
-                ans_index = 1
-                for answer in retval.answer:
-                    print("Answer %d [ %s%s%s ]" % (ans_index, color.G, answer, color.N))
-                    ans_index += 1
-                print("")
+        else:
+
+            if len(qnames) > 1:
+                print('server ', blanks,
+                      ' avg(ms)     min(ms)     max(ms)     stddev(ms)  lost(%) nxdomain(%) servfail(%)')
+                print((100 + width) * '-')
+            else:
+                print('server ', blanks,
+                      ' avg(ms)     min(ms)     max(ms)     stddev(ms)  lost(%)  ttl        flags                  response')
+                print((104 + width) * '-')
+
+            for server, resolver in resolvers:
+                server_data = [x for x in data if x['resolver'] == server]
+
+                r_min = min([x['r_min'] for x in server_data])
+                r_avg = sum([x['r_avg'] for x in server_data]) / len(server_data)
+                r_max = max([x['r_max'] for x in server_data])
+                r_stddev = sum([x['r_stddev'] for x in server_data]) / len(server_data)
+                r_lost_percent = sum([x['r_lost_percent'] for x in server_data]) / len(server_data)
+                nxdomain_percent = sum([x['rcode_text'] == 'NXDOMAIN' for x in server_data]) / len(server_data)
+                fail_percent = sum([x['rcode_text'] == 'SERVFAIL' for x in server_data]) / len(server_data)
+                s_ttl = server_data[0]['s_ttl']
+                text_flags = server_data[0]['text_flags']
+                rcode_text = server_data[0]['rcode_text']
+
+                if len(qnames) > 1:
+                    print("%s    %-8.3f    %-8.3f    %-8.3f    %-8.3f    %s%%%-3d%s    %-8.3f    %-8.3f" % (
+                        server.ljust(width + 1), r_avg, r_min, r_max, r_stddev, color.O if r_lost_percent > 0 else color.N,
+                        r_lost_percent,
+                        color.N, nxdomain_percent, fail_percent), flush=True)
+                else:
+                    print("%s    %-8.3f    %-8.3f    %-8.3f    %-8.3f    %s%%%-3d%s     %-8s  %21s   %-20s" % (
+                        server.ljust(width + 1), r_avg, r_min, r_max, r_stddev, color.O if r_lost_percent > 0 else color.N,
+                        r_lost_percent,
+                        color.N, s_ttl, text_flags, rcode_text), flush=True)
 
     except Exception as e:
-        print('%s: %s' % (server, e))
+        print('error: %s' % e)
         sys.exit(1)
 
 
